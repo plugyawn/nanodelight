@@ -1,7 +1,20 @@
+# nanodelight
+nanodelight is simple, no-nonsense LLM training with _delightful_ [1](https://arxiv.org/pdf/2603.14608) [2](https://arxiv.org/abs/2603.20521) [3](https://arxiv.org/abs/2603.20526) policy gradients. We extend base nanochat with:
+
+- [ ] PPO
+- [ ] PPO with _Delight_
+
+Delight is the sigmoid over the product of advantage and surprisal. The idea is to suppress wasteful mistake and highlight rare, successful actions. It was introduced by Ian Osband in March, 2026.
+Note that base nanochat is trained with GRPO and not PPO. Hence, nanodelight (expectedly) takes up more VRAM than base nanochat to train.
+
+
+----
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
+
 
 nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
 
