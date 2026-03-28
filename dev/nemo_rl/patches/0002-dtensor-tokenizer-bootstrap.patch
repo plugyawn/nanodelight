@@ -1,0 +1,49 @@
+diff --git a/nemo_rl/models/policy/lm_policy.py b/nemo_rl/models/policy/lm_policy.py
+index e21bd6d..589282e 100644
+--- a/nemo_rl/models/policy/lm_policy.py
++++ b/nemo_rl/models/policy/lm_policy.py
+@@ -211,8 +211,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
+             # pickling across incompatible transformers versions (v4 head → v5 worker).
+             config["tokenizer"]["use_processor"] = processor is not None
+         else:
+-            worker_kwargs["tokenizer"] = tokenizer
+-            worker_kwargs["processor"] = processor
++            # DTensor v1 workers can also reconstruct tokenizer/processor locally.
++            # This avoids pickling tokenizer objects across worker envs that may carry
++            # a different transformers version than the driver.
++            config["tokenizer"]["use_processor"] = processor is not None
+ 
+         worker_builder = RayWorkerBuilder(
+             worker_builder_cls_fqn,
+diff --git a/nemo_rl/models/policy/workers/dtensor_policy_worker.py b/nemo_rl/models/policy/workers/dtensor_policy_worker.py
+index 9116e42..fe922e4 100644
+--- a/nemo_rl/models/policy/workers/dtensor_policy_worker.py
++++ b/nemo_rl/models/policy/workers/dtensor_policy_worker.py
+@@ -175,7 +175,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+     def __init__(
+         self,
+         config: PolicyConfig,
+-        tokenizer: AutoTokenizer,
++        tokenizer: Optional[AutoTokenizer] = None,
+         processor: Optional[AutoProcessor] = None,
+         weights_path: Optional[str] = None,
+         optimizer_path: Optional[str] = None,
+@@ -184,6 +184,18 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+         **kwargs: Any,
+     ):
+         """Initialize the DTensorPolicyWorker."""
++        if tokenizer is None and processor is None:
++            from nemo_rl.algorithms.utils import get_tokenizer
++
++            use_processor = config["tokenizer"].get("use_processor", False)
++            result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
++            if use_processor:
++                processor = result
++                tokenizer = result.tokenizer
++            else:
++                tokenizer = result
++
++        assert tokenizer is not None, "Tokenizer must be available for DTensorPolicyWorker"
+         self.tokenizer = tokenizer
+         self.processor = processor
+         self.is_vlm = processor is not None
