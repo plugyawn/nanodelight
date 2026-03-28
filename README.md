@@ -1,11 +1,14 @@
 # nanodelight
 nanodelight is simple, no-nonsense LLM training with _delightful_ [1](https://arxiv.org/pdf/2603.14608) [2](https://arxiv.org/abs/2603.20521) [3](https://arxiv.org/abs/2603.20526) policy gradients. We extend base nanochat with:
 
+- [x] NeMo-RL DG-GRPO reference integration, screening harness, and GSM8K plots
+- [ ] Nanochat-native DG-GRPO in `scripts/chat_rl.py`
 - [ ] PPO
 - [ ] PPO with _Delight_
+- [ ] Longer GSM8K multi-seed ablations
 
 Delight is the sigmoid over the product of advantage and surprisal. The idea is to suppress wasteful mistake and highlight rare, successful actions. It was introduced by Ian Osband in March, 2026.
-Note that base nanochat is trained with GRPO and not PPO. Hence, nanodelight (expectedly) takes up more VRAM than base nanochat to train.
+Base nanochat is already trained with GRPO and not PPO, so the cleanest path for this fork is DG-GRPO before any PPO work. The current research-grade reference path lives in NVIDIA NeMo-RL; see [dev/nemo_rl/README.md](dev/nemo_rl/README.md) for the downstream patch and launcher, and [results/dg_gsm8k_runpod_20260328/README.md](results/dg_gsm8k_runpod_20260328/README.md) for the first GSM8K screening run on `Qwen/Qwen2.5-Math-1.5B-Instruct`.
 
 
 ----
