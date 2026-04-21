@@ -789,8 +789,6 @@ index 0000000..017add5
 +        raise ValueError("grpo.kondo.min_selected_rows must be at least 1")
 +    if cfg["block_size"] < 1:
 +        raise ValueError("grpo.kondo.block_size must be at least 1")
-+    if raw_cfg is not None and mode == "response_dense_rows_v2" and "block_size" in raw_cfg:
-+        raise ValueError("grpo.kondo.block_size is invalid for response_dense_rows_v2")
 +    priority_mode = cfg["priority_mode"]
 +    if priority_mode not in {
 +        "delight",
