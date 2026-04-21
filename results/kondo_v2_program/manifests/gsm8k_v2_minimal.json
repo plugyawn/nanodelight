@@ -1,0 +1,69 @@
+{
+  "name": "gsm8k_v2_minimal",
+  "description": "Minimal two-seed v2 Kondo family on held-out GSM8K.",
+  "dataset": {
+    "train": {
+      "dataset_name": "gsm8k",
+      "split": "train"
+    },
+    "validation": {
+      "dataset_name": "gsm8k",
+      "split": "test"
+    },
+    "split_validation_size": 0.0
+  },
+  "model": {
+    "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "tokenizer_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "prompt_file": "examples/prompts/cot.txt"
+  },
+  "recipe": {
+    "max_num_steps": 8,
+    "num_prompts_per_step": 2,
+    "num_generations_per_prompt": 4,
+    "val_period": 4,
+    "max_val_samples": 256,
+    "val_batch_size": 64,
+    "train_global_batch_size": 8,
+    "train_micro_batch_size": 1,
+    "logprob_batch_size": 1,
+    "max_total_sequence_length": 768,
+    "max_new_tokens": 320,
+    "vllm_max_model_len": 768,
+    "loss_fn": {
+      "dg_enabled": false
+    }
+  },
+  "execution": {
+    "apply_patches": false,
+    "uv_no_sync": true
+  },
+  "arms": [
+    {
+      "label": "baseline",
+      "grpo.kondo.enabled": false,
+      "grpo.kondo.mode": "off"
+    },
+    {
+      "label": "dense_0p7",
+      "grpo.kondo.enabled": true,
+      "grpo.kondo.mode": "dense_reference",
+      "grpo.kondo.target_backward_token_fraction": 0.7
+    },
+    {
+      "label": "oracle_dense_rows_0p7",
+      "grpo.kondo.enabled": true,
+      "grpo.kondo.mode": "oracle_dense_rows",
+      "grpo.kondo.target_backward_token_fraction": 0.7
+    },
+    {
+      "label": "response_dense_rows_v2_0p7",
+      "grpo.kondo.enabled": true,
+      "grpo.kondo.mode": "response_dense_rows_v2",
+      "grpo.kondo.target_backward_token_fraction": 0.7,
+      "grpo.kondo.recall_floor": 1.0
+    }
+  ],
+  "seeds": [42, 43],
+  "runner": "/Users/progyan/nanodelight/runs/nemo_grpo_kondo_v2_family.sh"
+}
