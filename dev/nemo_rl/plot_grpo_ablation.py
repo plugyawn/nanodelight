@@ -6,11 +6,17 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
 from tensorboard.backend.event_processing import event_accumulator
+
+try:
+    from .metric_semantics import finite_points, summarize_metric_points
+except ImportError:
+    from metric_semantics import finite_points, summarize_metric_points
 
 SIZE_GUIDANCE = {
     event_accumulator.TENSORS: 0,
@@ -26,7 +32,17 @@ DEFAULT_METRICS = [
     "train/dg_gate_negative_mean",
     "train/dg_gate_spread",
     "train/dg_surprisal_mean",
+    "train/kondo_actual_backward_token_fraction",
+    "train/kondo_rows_kept_fraction",
 ]
+
+KONDO_JSONL_OVERRIDE_METRICS = {
+    "train/kondo_actual_backward_token_fraction",
+    "train/kondo_skipped_token_fraction",
+    "train/kondo_rows_kept_fraction",
+    "train/kondo_rows_kept",
+    "train/kondo_rows_total",
+}
 
 
 @dataclass
@@ -38,23 +54,13 @@ class RunData:
 
 def summarize_metrics(
     metrics: dict[str, list[tuple[int, float]]],
-) -> dict[str, dict[str, float | int]]:
-    summary: dict[str, dict[str, float | int]] = {}
+) -> dict[str, dict[str, float | int | str | None]]:
+    summary: dict[str, dict[str, float | int | str | None]] = {}
     for name, points in metrics.items():
-        if not points:
+        metric_summary = summarize_metric_points(points, name)
+        if metric_summary is None:
             continue
-        final_step, final_value = points[-1]
-        best_step, best_value = max(points, key=lambda item: item[1])
-        worst_step, worst_value = min(points, key=lambda item: item[1])
-        summary[name] = {
-            "num_points": len(points),
-            "final_step": int(final_step),
-            "final_value": float(final_value),
-            "best_step": int(best_step),
-            "best_value": float(best_value),
-            "worst_step": int(worst_step),
-            "worst_value": float(worst_value),
-        }
+        summary[name] = metric_summary
     return summary
 
 
@@ -113,6 +119,126 @@ def load_reward_stats(run_dir: str) -> dict[str, dict[int, float]]:
     }
 
 
+def _flatten_numeric(value: object) -> list[float]:
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, list):
+        flattened: list[float] = []
+        for item in value:
+            flattened.extend(_flatten_numeric(item))
+        return flattened
+    return []
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def load_jsonl_metrics(run_dir: str) -> dict[str, dict[int, float]]:
+    metric_map: dict[str, dict[int, float]] = {}
+
+    train_files = sorted(
+        glob.glob(os.path.join(run_dir, "**", "train_data_step*.jsonl"), recursive=True)
+    )
+    for path in train_files:
+        step = int(
+            os.path.splitext(os.path.basename(path))[0].replace("train_data_step", "")
+        )
+        rewards: list[float] = []
+        total_valid_tokens = 0.0
+        total_backward_tokens = 0.0
+        total_rows = 0.0
+        kept_rows = 0.0
+        with open(path) as handle:
+            for line in handle:
+                sample = json.loads(line)
+                reward_values = _flatten_numeric(sample.get("rewards"))
+                rewards.extend(reward_values)
+
+                token_mask = _flatten_numeric(sample.get("token_loss_mask"))
+                valid_tokens = sum(token_mask)
+                total_valid_tokens += valid_tokens
+                total_rows += 1.0
+
+                row_selected_values = _flatten_numeric(sample.get("kondo_row_selected"))
+                row_selected = bool(row_selected_values and row_selected_values[0] >= 0.5)
+                if row_selected or "kondo_row_selected" not in sample:
+                    kept_rows += 1.0
+
+                if "loss_token_mask" in sample:
+                    total_backward_tokens += sum(
+                        _flatten_numeric(sample.get("loss_token_mask"))
+                    )
+                elif "kondo_row_selected" in sample:
+                    if row_selected:
+                        total_backward_tokens += valid_tokens
+                else:
+                    total_backward_tokens += valid_tokens
+
+        reward_mean = _mean(rewards)
+        if reward_mean is not None:
+            metric_map.setdefault("train/reward_mean", {})[step] = reward_mean
+        if rewards:
+            var = sum((x - reward_mean) ** 2 for x in rewards) / len(rewards)
+            metric_map.setdefault("train/reward_std", {})[step] = var**0.5
+        if total_valid_tokens > 0:
+            fraction = total_backward_tokens / total_valid_tokens
+            metric_map.setdefault(
+                "train/kondo_actual_backward_token_fraction", {}
+            )[step] = fraction
+            metric_map.setdefault("train/kondo_skipped_token_fraction", {})[
+                step
+            ] = 1.0 - fraction
+        if total_rows > 0:
+            metric_map.setdefault("train/kondo_rows_kept_fraction", {})[step] = (
+                kept_rows / total_rows
+            )
+            metric_map.setdefault("train/kondo_rows_kept", {})[step] = kept_rows
+            metric_map.setdefault("train/kondo_rows_total", {})[step] = total_rows
+
+    val_files = sorted(
+        glob.glob(os.path.join(run_dir, "**", "val_data_step*.jsonl"), recursive=True)
+    )
+    for path in val_files:
+        step = int(
+            os.path.splitext(os.path.basename(path))[0].replace("val_data_step", "")
+        )
+        rewards: list[float] = []
+        with open(path) as handle:
+            for line in handle:
+                sample = json.loads(line)
+                rewards.extend(_flatten_numeric(sample.get("rewards")))
+        accuracy = _mean(rewards)
+        if accuracy is not None:
+            metric_map.setdefault("validation/accuracy", {})[step] = accuracy
+
+    return metric_map
+
+
+def merge_metric_maps(
+    tensorboard_metrics: dict[str, dict[int, float]],
+    jsonl_metrics: dict[str, dict[int, float]],
+    reward_metrics: dict[str, dict[int, float]],
+) -> dict[str, dict[int, float]]:
+    metric_map = {
+        name: dict(points) for name, points in tensorboard_metrics.items()
+    }
+    for name, points in jsonl_metrics.items():
+        metric_steps = metric_map.setdefault(name, {})
+        for step, value in points.items():
+            if name in KONDO_JSONL_OVERRIDE_METRICS:
+                metric_steps[step] = value
+            else:
+                metric_steps.setdefault(step, value)
+    for name, points in reward_metrics.items():
+        metric_steps = metric_map.setdefault(name, {})
+        for step, value in points.items():
+            metric_steps.setdefault(step, value)
+    return metric_map
+
+
 def normalize_metrics(
     metric_map: dict[str, dict[int, float]],
 ) -> dict[str, list[tuple[int, float]]]:
@@ -133,12 +259,37 @@ def plot_metric(metric_name: str, runs: list[RunData], out_dir: str) -> None:
     plt.figure(figsize=(7, 4.5))
     plotted = False
     for run in runs:
-        points = run.metrics.get(metric_name, [])
-        if not points:
+        raw_points = run.metrics.get(metric_name, [])
+        if not raw_points:
             continue
-        steps = [step for step, _ in points]
-        values = [value for _, value in points]
-        plt.plot(steps, values, marker="o", linewidth=1.8, markersize=3, label=run.label)
+        finite = finite_points(raw_points)
+        if not finite:
+            continue
+        steps = [int(step) for step, _ in raw_points]
+        values = [
+            float(value) if math.isfinite(float(value)) else float("nan")
+            for _, value in raw_points
+        ]
+        (line,) = plt.plot(
+            steps,
+            values,
+            marker="o",
+            linewidth=1.8,
+            markersize=3,
+            label=run.label,
+        )
+        nonfinite_steps = [
+            int(step) for step, value in raw_points if not math.isfinite(float(value))
+        ]
+        if nonfinite_steps:
+            marker_y = max(value for _, value in finite)
+            plt.scatter(
+                nonfinite_steps,
+                [marker_y] * len(nonfinite_steps),
+                marker="x",
+                s=28,
+                color=line.get_color(),
+            )
         plotted = True
 
     if not plotted:
@@ -178,11 +329,14 @@ def main() -> None:
     metrics_to_plot = args.metric or DEFAULT_METRICS
     runs: list[RunData] = []
     merged_output: dict[str, dict[str, list[tuple[int, float]]]] = {}
-    summary_output: dict[str, dict[str, dict[str, float | int]]] = {}
+    summary_output: dict[str, dict[str, dict[str, float | int | str | None]]] = {}
 
     for label, run_dir in args.run:
-        metric_map = load_tensorboard_scalars(run_dir)
-        metric_map.update(load_reward_stats(run_dir))
+        metric_map = merge_metric_maps(
+            tensorboard_metrics=load_tensorboard_scalars(run_dir),
+            jsonl_metrics=load_jsonl_metrics(run_dir),
+            reward_metrics=load_reward_stats(run_dir),
+        )
         normalized = normalize_metrics(metric_map)
         runs.append(RunData(label=label, run_dir=run_dir, metrics=normalized))
         merged_output[label] = normalized
@@ -194,7 +348,7 @@ def main() -> None:
         json.dump(summary_output, handle, indent=2)
     with open(os.path.join(args.out_dir, "summary.tsv"), "w") as handle:
         handle.write(
-            "run\tmetric\tnum_points\tfinal_step\tfinal_value\tbest_step\tbest_value\tworst_step\tworst_value\n"
+            "run\tmetric\tdirection\tnum_points\tnum_finite_points\tfinal_step\tfinal_value\tfinal_is_finite\tmin_step\tmin_value\tmax_step\tmax_value\tbest_step\tbest_value\tworst_step\tworst_value\n"
         )
         for label, metric_summary in summary_output.items():
             for metric_name, stats in sorted(metric_summary.items()):
@@ -203,13 +357,20 @@ def main() -> None:
                         [
                             label,
                             metric_name,
+                            str(stats["direction"]),
                             str(stats["num_points"]),
+                            str(stats["num_finite_points"]),
                             str(stats["final_step"]),
                             str(stats["final_value"]),
-                            str(stats["best_step"]),
-                            str(stats["best_value"]),
-                            str(stats["worst_step"]),
-                            str(stats["worst_value"]),
+                            str(stats["final_is_finite"]),
+                            str(stats["min_step"]),
+                            str(stats["min_value"]),
+                            str(stats["max_step"]),
+                            str(stats["max_value"]),
+                            "" if stats["best_step"] is None else str(stats["best_step"]),
+                            "" if stats["best_value"] is None else str(stats["best_value"]),
+                            "" if stats["worst_step"] is None else str(stats["worst_step"]),
+                            "" if stats["worst_value"] is None else str(stats["worst_value"]),
                         ]
                     )
                     + "\n"

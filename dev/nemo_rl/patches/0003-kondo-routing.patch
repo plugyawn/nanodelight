@@ -1,0 +1,1814 @@
+diff --git a/examples/configs/grpo_math_1B.yaml b/examples/configs/grpo_math_1B.yaml
+index dbde6a9..78b962a 100644
+--- a/examples/configs/grpo_math_1B.yaml
++++ b/examples/configs/grpo_math_1B.yaml
+@@ -31,6 +31,15 @@ grpo:
+     normalize_rewards: ${grpo.normalize_rewards}
+     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
++  kondo:
++    enabled: false
++    mode: "response_dense_rows_v2"
++    target_backward_token_fraction: 0.7
++    recall_floor: 1.0
++    priority_mode: "delight"
++    block_size: 8
++    min_selected_rows: 1
++    bypass_on_nonfinite: true
+   reward_scaling:
+     enabled: false
+     source_min: 0.0
+@@ -68,6 +77,8 @@ loss_fn:
+   token_level_loss: true
+   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
++  dg_enabled: false
++  dg_eta: 1.0
+ 
+ checkpointing:
+   enabled: true
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index e550429..d7b3288 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -36,7 +36,15 @@ from nemo_rl.algorithms.loss import (
+     ClippedPGLossDataDict,
+     ClippedPGLossFn,
+ )
+-from nemo_rl.algorithms.loss.interfaces import LossFunction
++from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
++from nemo_rl.algorithms.kondo import (
++    KondoConfig,
++    apply_kondo_mode,
++    compute_required_row_multiple,
++    disabled_kondo_metrics,
++    resolve_kondo_config,
++    screen_kondo_tokens,
++)
+ from nemo_rl.algorithms.reward_functions import (
+     RewardShapingConfig,
+     apply_reward_shaping,
+@@ -169,6 +177,7 @@ class GRPOConfig(TypedDict):
+     seq_logprob_error_threshold: float | None
+     # Advantage estimator configuration (grpo or reinforce_plus_plus)
+     adv_estimator: NotRequired[AdvEstimatorConfig]
++    kondo: NotRequired[KondoConfig]
+ 
+ 
+ class GRPOSaveState(TypedDict):
+@@ -213,6 +222,35 @@ class MasterConfig(TypedDict):
+ # ===============================================================================
+ 
+ 
++def _get_policy_data_parallel_size(policy: Policy) -> int:
++    sharding_annotations = getattr(policy, "sharding_annotations", None)
++    if sharding_annotations is None:
++        return 1
++    return sharding_annotations.get_axis_size("data_parallel")
++
++
++def _prepare_kondo_configuration(
++    *,
++    policy: Policy,
++    master_config: MasterConfig,
++    loss_fn: ClippedPGLossFn,
++) -> tuple[KondoConfig, int]:
++    kondo_cfg = resolve_kondo_config(master_config["grpo"].get("kondo"))
++    if getattr(loss_fn, "dg_enabled", False):
++        raise ValueError("DG and Kondo are mutually exclusive in v1")
++    if getattr(loss_fn, "loss_type", None) != LossType.TOKEN_LEVEL:
++        raise ValueError("Kondo requires token-level clipped PG loss")
++
++    dp_size = _get_policy_data_parallel_size(policy)
++    row_multiple = compute_required_row_multiple(
++        dp_size=dp_size,
++        train_micro_batch_size=master_config["policy"]["train_micro_batch_size"],
++        use_dynamic_batching=master_config["policy"]["dynamic_batching"]["enabled"],
++        use_sequence_packing=master_config["policy"]["sequence_packing"]["enabled"],
++    )
++    return kondo_cfg, row_multiple
++
++
+ def setup(
+     master_config: MasterConfig,
+     tokenizer: TokenizerType,
+@@ -1801,6 +1839,28 @@ def grpo_train(
+                     )
+                     del baseline_for_log
+ 
++                kondo_metrics = disabled_kondo_metrics("off")
++                policy_train_data = train_data
++                if master_config["grpo"].get("kondo", {}).get(
++                    "enabled", False
++                ) and master_config["grpo"].get("kondo", {}).get(
++                    "mode", "routed"
++                ) != "off":
++                    kondo_cfg, row_multiple = _prepare_kondo_configuration(
++                        policy=policy,
++                        master_config=master_config,
++                        loss_fn=loss_fn,
++                    )
++                    with timer.time("kondo_screen"):
++                        kondo_screening = screen_kondo_tokens(train_data, kondo_cfg)
++                    with timer.time("kondo_compact"):
++                        policy_train_data, kondo_metrics = apply_kondo_mode(
++                            train_data=train_data,
++                            screening=kondo_screening,
++                            cfg=kondo_cfg,
++                            row_multiple=row_multiple,
++                        )
++
+                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
+                 print("▶ Preparing for training...", flush=True)
+                 with timer.time("training_prep"):
+@@ -1810,8 +1870,9 @@ def grpo_train(
+                 print("▶ Training policy...", flush=True)
+                 with timer.time("policy_training"):
+                     train_results = policy.train(
+-                        train_data,
++                        policy_train_data,
+                         loss_fn,
++                        gbs=policy_train_data.size,
+                         timer=timer,
+                     )
+ 
+@@ -1823,7 +1884,7 @@ def grpo_train(
+                             flush=True,
+                         )
+                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
+-                            train_data, include_q=True
++                            policy_train_data, include_q=True
+                         )["layers"]
+                         # Set generation as stale to force refit with new scales
+                         POLICY_GENERATION_STALE = True
+@@ -1898,6 +1959,7 @@ def grpo_train(
+                     else 0.0,
+                     **ds_metrics,
+                 }
++                metrics.update(kondo_metrics)
+                 if "moe_metrics" in train_results:
+                     metrics.update(
+                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+@@ -1908,13 +1970,27 @@ def grpo_train(
+ 
+                 metrics.update(train_results["all_mb_metrics"])
+                 metrics.update(gen_step_metrics)
++                dg_mean_metrics = {
++                    "dg_enabled",
++                    "dg_eta",
++                    "dg_gate_mean",
++                    "dg_gate_std",
++                    "dg_gate_positive_mean",
++                    "dg_gate_negative_mean",
++                    "dg_gate_spread",
++                    "dg_surprisal_mean",
++                }
+                 for k, v in metrics.items():
+                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                         valid_values = [x for x in v if not np.isinf(x)]
+                         metrics[k] = (
+                             np.min(valid_values).item() if valid_values else -1.0
+                         )
+-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
++                    elif k in {
++                        "probs_ratio_max",
++                        "probs_ratio_clamped_max",
++                        "dg_surprisal_max",
++                    }:
+                         valid_values = [x for x in v if not np.isinf(x)]
+                         metrics[k] = (
+                             np.max(valid_values).item() if valid_values else -1.0
+@@ -1927,10 +2003,12 @@ def grpo_train(
+                         "global_valid_seqs",
+                         "global_valid_toks",
+                         "mean_prompt_length",
+-                    }:
++                    } | dg_mean_metrics:
+                         metrics[k] = np.mean(v).item()
+                     elif isinstance(v, (np.ndarray, list)):
+                         metrics[k] = np.sum(v).item()
++                    elif np.isscalar(v):
++                        metrics[k] = float(v)
+                     else:
+                         print(f"Skipping aggregation for {k} ({type(v)})")
+ 
+@@ -2059,6 +2137,12 @@ def grpo_train(
+                 log_data["token_ids"] = train_data["input_ids"].tolist()
+                 log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                 log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
++                if "loss_token_mask" in train_data:
++                    log_data["loss_token_mask"] = train_data["loss_token_mask"].tolist()
++                if "kondo_row_selected" in train_data:
++                    log_data["kondo_row_selected"] = train_data[
++                        "kondo_row_selected"
++                    ].tolist()
+                 log_data["advantages"] = train_data["advantages"].tolist()
+                 log_data["generation_logprobs"] = train_data[
+                     "generation_logprobs"
+@@ -2836,6 +2920,28 @@ def async_grpo_train(
+                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                     )
+ 
++                kondo_metrics = disabled_kondo_metrics("off")
++                policy_train_data = train_data
++                if master_config["grpo"].get("kondo", {}).get(
++                    "enabled", False
++                ) and master_config["grpo"].get("kondo", {}).get(
++                    "mode", "routed"
++                ) != "off":
++                    kondo_cfg, row_multiple = _prepare_kondo_configuration(
++                        policy=policy,
++                        master_config=master_config,
++                        loss_fn=loss_fn,
++                    )
++                    with timer.time("kondo_screen"):
++                        kondo_screening = screen_kondo_tokens(train_data, kondo_cfg)
++                    with timer.time("kondo_compact"):
++                        policy_train_data, kondo_metrics = apply_kondo_mode(
++                            train_data=train_data,
++                            screening=kondo_screening,
++                            cfg=kondo_cfg,
++                            row_multiple=row_multiple,
++                        )
++
+                 print("▶ Preparing for training...")
+                 with timer.time("training_prep"):
+                     policy.prepare_for_training()
+@@ -2844,8 +2950,9 @@ def async_grpo_train(
+                 print("▶ Training policy...")
+                 with timer.time("policy_training"):
+                     train_results = policy.train(
+-                        train_data,
++                        policy_train_data,
+                         loss_fn,
++                        gbs=policy_train_data.size,
+                         timer=timer,
+                     )
+ 
+@@ -2951,18 +3058,33 @@ def async_grpo_train(
+                     if response_advantages.numel() > 0
+                     else 0.0,
+                 }
++                metrics.update(kondo_metrics)
+                 if "moe_metrics" in train_results:
+                     metrics.update(
+                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                     )
+                 metrics.update(train_results["all_mb_metrics"])
++                dg_mean_metrics = {
++                    "dg_enabled",
++                    "dg_eta",
++                    "dg_gate_mean",
++                    "dg_gate_std",
++                    "dg_gate_positive_mean",
++                    "dg_gate_negative_mean",
++                    "dg_gate_spread",
++                    "dg_surprisal_mean",
++                }
+                 for k, v in metrics.items():
+                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
+                         valid_values = [x for x in v if not np.isinf(x)]
+                         metrics[k] = (
+                             np.min(valid_values).item() if valid_values else -1.0
+                         )
+-                    elif k in {"probs_ratio_max", "probs_ratio_clamped_max"}:
++                    elif k in {
++                        "probs_ratio_max",
++                        "probs_ratio_clamped_max",
++                        "dg_surprisal_max",
++                    }:
+                         valid_values = [x for x in v if not np.isinf(x)]
+                         metrics[k] = (
+                             np.max(valid_values).item() if valid_values else -1.0
+@@ -2974,8 +3096,10 @@ def async_grpo_train(
+                         "global_valid_seqs",
+                         "global_valid_toks",
+                         "mean_prompt_length",
+-                    }:
++                    } | dg_mean_metrics:
+                         metrics[k] = np.mean(v).item()
++                    elif np.isscalar(v):
++                        metrics[k] = float(v)
+                     else:
+                         metrics[k] = np.sum(v).item()
+                 metrics.update(rollout_metrics)
+@@ -3084,6 +3208,10 @@ def async_grpo_train(
+             log_data["token_ids"] = train_data["input_ids"].tolist()
+             log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+             log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
++            if "loss_token_mask" in train_data:
++                log_data["loss_token_mask"] = train_data["loss_token_mask"].tolist()
++            if "kondo_row_selected" in train_data:
++                log_data["kondo_row_selected"] = train_data["kondo_row_selected"].tolist()
+             log_data["advantages"] = train_data["advantages"].tolist()
+             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
+             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+diff --git a/nemo_rl/algorithms/loss/loss_functions.py b/nemo_rl/algorithms/loss/loss_functions.py
+index ab05586..4ff4317 100755
+--- a/nemo_rl/algorithms/loss/loss_functions.py
++++ b/nemo_rl/algorithms/loss/loss_functions.py
+@@ -56,6 +56,9 @@ class ClippedPGLossConfig(TypedDict):
+     force_on_policy_ratio: NotRequired[bool]
+     # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+     use_kl_in_reward: NotRequired[bool]
++    # Delightful Policy Gradient gate settings.
++    dg_enabled: NotRequired[bool]
++    dg_eta: NotRequired[float]
+ 
+ 
+ class ClippedPGLossDataDict(TypedDict):
+@@ -68,6 +71,8 @@ class ClippedPGLossDataDict(TypedDict):
+     reference_policy_logprobs: torch.Tensor
+     token_mask: torch.Tensor
+     sample_mask: torch.Tensor
++    loss_token_mask: NotRequired[torch.Tensor]
++    loss_normalizer: NotRequired[torch.Tensor]
+     __extra__: Any
+ 
+ 
+@@ -126,6 +131,8 @@ class ClippedPGLossFn(LossFunction):
+         self.force_on_policy_ratio = cfg.get(
+             "force_on_policy_ratio", False
+         )  # Force ratio to 1.0
++        self.dg_enabled = cfg.get("dg_enabled", False)
++        self.dg_eta = cfg.get("dg_eta", 1.0)
+         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
+         self.use_importance_sampling_correction = cfg[
+             "use_importance_sampling_correction"
+@@ -187,6 +194,7 @@ class ClippedPGLossFn(LossFunction):
+                     f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
+                     flush=True,
+                 )
++        assert self.dg_eta > 0, "dg_eta must be positive"
+ 
+     def __call__(
+         self,
+@@ -199,6 +207,9 @@ class ClippedPGLossFn(LossFunction):
+         curr_logprobs = next_token_logprobs
+         token_mask = data["token_mask"][:, 1:]
+         sample_mask = data["sample_mask"]
++        loss_token_mask = data.get("loss_token_mask")
++        if loss_token_mask is not None:
++            loss_token_mask = loss_token_mask[:, 1:]
+         advantages = data["advantages"][:, 1:]
+         prev_logprobs = data["prev_logprobs"][:, 1:]
+         generation_logprobs = data["generation_logprobs"][:, 1:]
+@@ -209,6 +220,21 @@ class ClippedPGLossFn(LossFunction):
+             )
+ 
+         mask = token_mask * sample_mask.unsqueeze(-1)
++        pg_mask = (
++            loss_token_mask * sample_mask.unsqueeze(-1)
++            if loss_token_mask is not None
++            else mask
++        )
++        loss_normalizer = data.get("loss_normalizer")
++        if loss_normalizer is not None:
++            if self.loss_type != LossType.TOKEN_LEVEL:
++                raise ValueError("loss_normalizer is only supported for token-level PG")
++            loss_normalizer = loss_normalizer.reshape(-1)[0].to(curr_logprobs.device)
++        kl_normalizer = data.get("kl_normalizer")
++        if kl_normalizer is not None:
++            if self.loss_type != LossType.TOKEN_LEVEL:
++                raise ValueError("kl_normalizer is only supported for token-level PG")
++            kl_normalizer = kl_normalizer.reshape(-1)[0].to(curr_logprobs.device)
+ 
+         # token_mult_prob_error
+         # See more details and other metrics in docs/guides/grpo.md#metrics
+@@ -310,9 +336,12 @@ class ClippedPGLossFn(LossFunction):
+ 
+             # Reduce KL loss
+             if self.loss_type == LossType.TOKEN_LEVEL:
+-                kl = masked_mean(
+-                    kl, mask, global_normalization_factor=global_valid_toks
+-                )
++                if kl_normalizer is None:
++                    kl = masked_mean(
++                        kl, mask, global_normalization_factor=global_valid_toks
++                    )
++                else:
++                    kl = (kl * mask).sum() / kl_normalizer.clamp(min=1.0)
+             else:
+                 kl = masked_mean(
+                     masked_mean(kl, token_mask, dim=-1),
+@@ -348,8 +377,20 @@ class ClippedPGLossFn(LossFunction):
+             ratios = curr_logprobs
+             ratios_clamped = curr_logprobs
+ 
+-        loss1 = -advantages * ratios
+-        loss2 = -advantages * ratios_clamped
++        if self.dg_enabled:
++            # DG uses the sampled token surprisal under the rollout policy.
++            # prev_logprobs are re-scored with the training backend before any updates,
++            # so they are the cleanest available surrogate in the current pipeline.
++            dg_surprisal = (-prev_logprobs).detach()
++            dg_gate = torch.sigmoid((advantages.detach() * dg_surprisal) / self.dg_eta)
++            pg_advantages = advantages * dg_gate
++        else:
++            dg_surprisal = (-prev_logprobs).detach()
++            dg_gate = torch.ones_like(advantages)
++            pg_advantages = advantages
++
++        loss1 = -pg_advantages * ratios
++        loss2 = -pg_advantages * ratios_clamped
+ 
+         # Determine which value to use for clipping (max for pessimistic estimate)
+         clip_loss = torch.max(loss1, loss2)
+@@ -359,7 +400,7 @@ class ClippedPGLossFn(LossFunction):
+             assert self.ratio_clip_c > 1, (
+                 f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
+             )
+-            loss3 = -advantages * self.ratio_clip_c
++            loss3 = -pg_advantages * self.ratio_clip_c
+             clip_loss = torch.where(
+                 advantages < 0, torch.min(clip_loss, loss3), clip_loss
+             )
+@@ -475,11 +516,17 @@ class ClippedPGLossFn(LossFunction):
+             importance_weights_to_use = torch.ones_like(prev_logprobs)
+ 
+         if self.loss_type == LossType.TOKEN_LEVEL:
+-            actor_loss = masked_mean(
+-                importance_weights_to_use * clip_loss,
+-                mask,
+-                global_normalization_factor=global_valid_toks,
+-            )
++            if loss_normalizer is None:
++                actor_loss = masked_mean(
++                    importance_weights_to_use * clip_loss,
++                    pg_mask,
++                    global_normalization_factor=global_valid_toks,
++                )
++            else:
++                actor_loss = (
++                    (importance_weights_to_use * clip_loss * pg_mask).sum()
++                    / loss_normalizer.clamp(min=1.0)
++                )
+         else:
+             actor_loss = masked_mean(
+                 masked_mean(
+@@ -544,6 +591,36 @@ class ClippedPGLossFn(LossFunction):
+                 probs_ratio_clamped_min = float("inf")
+                 probs_ratio_clamped_max = float("-inf")
+ 
++            valid_mask = mask.bool()
++            valid_gates = dg_gate.detach()[valid_mask]
++            valid_surprisal = dg_surprisal.detach()[valid_mask]
++            valid_advantages = advantages.detach()[valid_mask]
++
++            if valid_gates.numel() > 0:
++                dg_gate_mean = valid_gates.mean().item()
++                dg_gate_std = valid_gates.std(unbiased=False).item()
++                dg_surprisal_mean = valid_surprisal.mean().item()
++                dg_surprisal_max = valid_surprisal.max().item()
++            else:
++                dg_gate_mean = 1.0
++                dg_gate_std = 0.0
++                dg_surprisal_mean = 0.0
++                dg_surprisal_max = 0.0
++
++            pos_gate_mask = valid_advantages > 0
++            neg_gate_mask = valid_advantages < 0
++            dg_gate_positive_mean = (
++                valid_gates[pos_gate_mask].mean().item()
++                if pos_gate_mask.any()
++                else dg_gate_mean
++            )
++            dg_gate_negative_mean = (
++                valid_gates[neg_gate_mask].mean().item()
++                if neg_gate_mask.any()
++                else dg_gate_mean
++            )
++            dg_gate_spread = dg_gate_positive_mean - dg_gate_negative_mean
++
+         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
+         # by either sequence or token count, depending on particular metric.
+         # To get the true metric, you'll need to sum over the microbatch.
+@@ -565,6 +642,15 @@ class ClippedPGLossFn(LossFunction):
+                 "sampling_importance_ratio": sample_importance_ratio.item(),
+                 "num_valid_samples": sample_mask.sum().item(),
+                 "approx_entropy": seq_entropy_approx.item(),
++                "dg_enabled": float(self.dg_enabled),
++                "dg_eta": self.dg_eta,
++                "dg_gate_mean": dg_gate_mean,
++                "dg_gate_std": dg_gate_std,
++                "dg_gate_positive_mean": dg_gate_positive_mean,
++                "dg_gate_negative_mean": dg_gate_negative_mean,
++                "dg_gate_spread": dg_gate_spread,
++                "dg_surprisal_mean": dg_surprisal_mean,
++                "dg_surprisal_max": dg_surprisal_max,
+                 **_is_filter_metrics,
+             },
+         )
+diff --git a/nemo_rl/distributed/model_utils.py b/nemo_rl/distributed/model_utils.py
+index 3c98cdb..017a5a4 100644
+--- a/nemo_rl/distributed/model_utils.py
++++ b/nemo_rl/distributed/model_utils.py
+@@ -15,12 +15,6 @@
+ from typing import Any, Optional
+ 
+ import torch
+-from megatron.core.models.gpt import GPTModel
+-from megatron.core.parallel_state import (
+-    get_tensor_model_parallel_group,
+-    get_tensor_model_parallel_rank,
+-)
+-from megatron.core.utils import deprecate_inference_params, get_pg_size
+ from torch.distributed.tensor import DTensor, distribute_tensor
+ 
+ from nemo_rl.algorithms.logits_sampling_utils import (
+@@ -30,6 +24,29 @@ from nemo_rl.algorithms.logits_sampling_utils import (
+ )
+ 
+ 
++def _get_megatron_model_utils():
++    """Lazily import Megatron symbols used only by linear-CE-fusion helpers.
++
++    Importing Megatron at module import time also pulls in Transformer Engine.
++    DTensor/FSDP GRPO paths do not need those symbols unless they explicitly
++    enable the Megatron-only linear-CE-fusion patch, so keep the dependency lazy.
++    """
++    from megatron.core.models.gpt import GPTModel
++    from megatron.core.parallel_state import (
++        get_tensor_model_parallel_group,
++        get_tensor_model_parallel_rank,
++    )
++    from megatron.core.utils import deprecate_inference_params, get_pg_size
++
++    return (
++        GPTModel,
++        get_tensor_model_parallel_group,
++        get_tensor_model_parallel_rank,
++        deprecate_inference_params,
++        get_pg_size,
++    )
++
++
+ @torch.no_grad()
+ def _compute_distributed_log_softmax(
+     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+@@ -1950,6 +1967,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
+ 
+ 
+ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
++    GPTModel, _, _, _, _ = _get_megatron_model_utils()
+     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
+         GPTModel._linear_ce_fusion_chunk_size = chunk_size
+         return
+@@ -1960,7 +1978,7 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+ 
+ 
+ def _gpt_forward_with_linear_ce_fusion(
+-    self: GPTModel,
++    self: Any,
+     input_ids: torch.Tensor,
+     position_ids: torch.Tensor,
+     attention_mask: torch.Tensor,
+@@ -1976,6 +1994,13 @@ def _gpt_forward_with_linear_ce_fusion(
+     padding_mask: Optional[torch.Tensor] = None,
+     return_logprobs_for_linear_ce_fusion: bool = False,
+ ) -> torch.Tensor:
++    (
++        _GPTModel,
++        get_tensor_model_parallel_group,
++        get_tensor_model_parallel_rank,
++        deprecate_inference_params,
++        get_pg_size,
++    ) = _get_megatron_model_utils()
+     if not return_logprobs_for_linear_ce_fusion:
+         return self._original_forward_for_linear_ce_fusion(
+             input_ids=input_ids,
+diff --git a/nemo_rl/distributed/ray_actor_environment_registry.py b/nemo_rl/distributed/ray_actor_environment_registry.py
+index 9567787..5fed32e 100644
+--- a/nemo_rl/distributed/ray_actor_environment_registry.py
++++ b/nemo_rl/distributed/ray_actor_environment_registry.py
+@@ -26,12 +26,15 @@ SGLANG_EXECUTABLE = (
+ MCORE_EXECUTABLE = (
+     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
+ )
++FSDP_EXECUTABLE = (
++    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.FSDP
++)
+ 
+ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
+     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
+     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
+     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": SGLANG_EXECUTABLE,
+-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.FSDP,
++    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": FSDP_EXECUTABLE,
+     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": PY_EXECUTABLES.AUTOMODEL,
+     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
+     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
+diff --git a/nemo_rl/models/policy/lm_policy.py b/nemo_rl/models/policy/lm_policy.py
+index e21bd6d..589282e 100644
+--- a/nemo_rl/models/policy/lm_policy.py
++++ b/nemo_rl/models/policy/lm_policy.py
+@@ -211,8 +211,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
+             # pickling across incompatible transformers versions (v4 head → v5 worker).
+             config["tokenizer"]["use_processor"] = processor is not None
+         else:
+-            worker_kwargs["tokenizer"] = tokenizer
+-            worker_kwargs["processor"] = processor
++            # DTensor v1 workers can also reconstruct tokenizer/processor locally.
++            # This avoids pickling tokenizer objects across worker envs that may carry
++            # a different transformers version than the driver.
++            config["tokenizer"]["use_processor"] = processor is not None
+ 
+         worker_builder = RayWorkerBuilder(
+             worker_builder_cls_fqn,
+diff --git a/nemo_rl/models/policy/utils.py b/nemo_rl/models/policy/utils.py
+index bbd2e6d..3d0b4f6 100644
+--- a/nemo_rl/models/policy/utils.py
++++ b/nemo_rl/models/policy/utils.py
+@@ -84,9 +84,10 @@ class IPCProtocol(Enum):
+ 
+ def resolve_model_class(model_name: str) -> Any:
+     """Resolve the appropriate model class for a given model name."""
+-    if NEMO_AUTOMODEL_AVAILABLE:
+-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
+-    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
++    resolved = AUTOMODEL_FACTORY.get(model_name.lower())
++    if resolved is not None:
++        return resolved
++    return AutoModelForCausalLM
+ 
+ 
+ def is_vllm_v1_engine_enabled() -> bool:
+diff --git a/nemo_rl/models/policy/workers/dtensor_policy_worker.py b/nemo_rl/models/policy/workers/dtensor_policy_worker.py
+index 9116e42..fe922e4 100644
+--- a/nemo_rl/models/policy/workers/dtensor_policy_worker.py
++++ b/nemo_rl/models/policy/workers/dtensor_policy_worker.py
+@@ -175,7 +175,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+     def __init__(
+         self,
+         config: PolicyConfig,
+-        tokenizer: AutoTokenizer,
++        tokenizer: Optional[AutoTokenizer] = None,
+         processor: Optional[AutoProcessor] = None,
+         weights_path: Optional[str] = None,
+         optimizer_path: Optional[str] = None,
+@@ -184,6 +184,18 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+         **kwargs: Any,
+     ):
+         """Initialize the DTensorPolicyWorker."""
++        if tokenizer is None and processor is None:
++            from nemo_rl.algorithms.utils import get_tokenizer
++
++            use_processor = config["tokenizer"].get("use_processor", False)
++            result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
++            if use_processor:
++                processor = result
++                tokenizer = result.tokenizer
++            else:
++                tokenizer = result
++
++        assert tokenizer is not None, "Tokenizer must be available for DTensorPolicyWorker"
+         self.tokenizer = tokenizer
+         self.processor = processor
+         self.is_vlm = processor is not None
+diff --git a/nemo_rl/algorithms/kondo.py b/nemo_rl/algorithms/kondo.py
+new file mode 100644
+index 0000000..017add5
+--- /dev/null
++++ b/nemo_rl/algorithms/kondo.py
+@@ -0,0 +1,823 @@
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from typing import Any, Literal, TypedDict
++
++import torch
++from typing_extensions import NotRequired
++
++from nemo_rl.distributed.batched_data_dict import BatchedDataDict
++
++KondoMode = Literal[
++    "off",
++    "dense_reference",
++    "block_dense_cover",
++    "routed",
++    "response_dense_rows",
++    "response_dense_rows_v2",
++    "response_block_rows",
++    "response_routed",
++    "oracle_dense_rows",
++    "oracle_block_rows",
++    "oracle_full_rows",
++]
++KondoPriorityMode = Literal[
++    "delight",
++    "advantage",
++    "abs_advantage",
++    "surprisal",
++    "uniform",
++]
++
++
++class KondoConfig(TypedDict):
++    enabled: bool
++    mode: NotRequired[KondoMode]
++    target_backward_token_fraction: NotRequired[float]
++    recall_floor: NotRequired[float]
++    min_selected_token_recall: NotRequired[float]
++    priority_mode: NotRequired[KondoPriorityMode]
++    block_size: NotRequired[int]
++    min_selected_rows: NotRequired[int]
++    bypass_on_nonfinite: NotRequired[bool]
++
++
++@dataclass(frozen=True)
++class KondoScreeningResult:
++    loss_token_mask: torch.Tensor
++    loss_normalizer: torch.Tensor
++    kl_normalizer: torch.Tensor
++    valid_token_mask: torch.Tensor
++    screen_mask: torch.Tensor
++    reference_token_gate: torch.Tensor
++    priority: torch.Tensor
++    row_cost: torch.Tensor
++    row_utility: torch.Tensor
++    row_response_utility: torch.Tensor
++    row_response_density: torch.Tensor
++    row_reference_tokens: torch.Tensor
++    row_abs_priority: torch.Tensor
++    total_valid_tokens: int
++    total_reference_tokens: int
++    screenable_token_count: int
++    nonfinite_screen_token_count: int
++    rows_total: int
++    should_bypass: bool
++
++
++def resolve_kondo_config(raw_cfg: dict[str, Any] | None) -> KondoConfig:
++    cfg: KondoConfig = {
++        "enabled": False,
++        "mode": "response_dense_rows_v2",
++        "target_backward_token_fraction": 0.5,
++        "recall_floor": 1.0,
++        "priority_mode": "delight",
++        "block_size": 8,
++        "min_selected_rows": 1,
++        "bypass_on_nonfinite": True,
++    }
++    if raw_cfg is not None:
++        cfg.update(raw_cfg)
++    if "recall_floor" not in cfg and "min_selected_token_recall" in cfg:
++        cfg["recall_floor"] = cfg["min_selected_token_recall"]
++
++    mode = cfg["mode"]
++    if mode not in {
++        "off",
++        "dense_reference",
++        "block_dense_cover",
++        "routed",
++        "response_dense_rows",
++        "response_dense_rows_v2",
++        "response_block_rows",
++        "response_routed",
++        "oracle_dense_rows",
++        "oracle_block_rows",
++        "oracle_full_rows",
++    }:
++        raise ValueError(f"Unsupported Kondo mode: {mode}")
++    fraction = cfg["target_backward_token_fraction"]
++    if not (0.0 < fraction <= 1.0):
++        raise ValueError(
++            "grpo.kondo.target_backward_token_fraction must be in (0, 1]"
++        )
++    if mode == "response_dense_rows_v2":
++        if "recall_floor" not in cfg:
++            cfg["recall_floor"] = 1.0
++    else:
++        cfg.setdefault("recall_floor", 0.0)
++    recall_floor = cfg["recall_floor"]
++    if not (0.0 <= recall_floor <= 1.0):
++        raise ValueError("grpo.kondo.recall_floor must be in [0, 1]")
++    if mode == "response_dense_rows_v2" and recall_floor <= 0.0:
++        raise ValueError("grpo.kondo.recall_floor must be in (0, 1] for v2")
++    if cfg["min_selected_rows"] < 1:
++        raise ValueError("grpo.kondo.min_selected_rows must be at least 1")
++    if cfg["block_size"] < 1:
++        raise ValueError("grpo.kondo.block_size must be at least 1")
++    if raw_cfg is not None and mode == "response_dense_rows_v2" and "block_size" in raw_cfg:
++        raise ValueError("grpo.kondo.block_size is invalid for response_dense_rows_v2")
++    priority_mode = cfg["priority_mode"]
++    if priority_mode not in {
++        "delight",
++        "advantage",
++        "abs_advantage",
++        "surprisal",
++        "uniform",
++    }:
++        raise ValueError(f"Unsupported Kondo priority mode: {priority_mode}")
++    return cfg
++
++
++def kondo_mode_metric(mode: KondoMode) -> float:
++    if mode == "off":
++        return 0.0
++    if mode == "dense_reference":
++        return 1.0
++    if mode == "block_dense_cover":
++        return 1.5
++    if mode == "routed":
++        return 2.0
++    if mode == "response_dense_rows":
++        return 2.5
++    if mode == "response_dense_rows_v2":
++        return 2.6
++    if mode == "response_block_rows":
++        return 2.75
++    if mode == "response_routed":
++        return 3.0
++    if mode == "oracle_dense_rows":
++        return 4.0
++    if mode == "oracle_block_rows":
++        return 4.5
++    if mode == "oracle_full_rows":
++        return 5.0
++    raise ValueError(f"Unsupported Kondo mode: {mode}")
++
++
++def disabled_kondo_metrics(mode: KondoMode = "off") -> dict[str, float]:
++    return {
++        "kondo_enabled": 0.0,
++        "kondo_mode": kondo_mode_metric(mode),
++        "kondo_target_backward_token_fraction": 0.0,
++        "kondo_recall_floor": 0.0,
++        "kondo_recall_floor_satisfied": 0.0,
++        "kondo_rows_kept": 0.0,
++        "kondo_rows_total": 0.0,
++        "kondo_selected_token_recall": 0.0,
++        "kondo_selected_token_fraction": 0.0,
++        "kondo_actual_backward_token_fraction": 0.0,
++        "kondo_kept_row_token_fraction": 0.0,
++        "kondo_nonfinite_screen_token_count": 0.0,
++        "kondo_block_size": 0.0,
++        "kondo_bypass_step": 0.0,
++    }
++
++
++def compute_token_priority(
++    advantages: torch.Tensor,
++    surprisal: torch.Tensor,
++    priority_mode: KondoPriorityMode,
++) -> torch.Tensor:
++    if priority_mode == "delight":
++        return advantages * surprisal
++    if priority_mode == "advantage":
++        return advantages
++    if priority_mode == "abs_advantage":
++        return advantages.abs()
++    if priority_mode == "surprisal":
++        return surprisal
++    if priority_mode == "uniform":
++        return torch.ones_like(surprisal)
++    raise ValueError(f"Unsupported Kondo priority mode: {priority_mode}")
++
++
++def compute_required_row_multiple(
++    dp_size: int,
++    train_micro_batch_size: int,
++    use_dynamic_batching: bool,
++    use_sequence_packing: bool,
++) -> int:
++    if dp_size < 1:
++        raise ValueError("dp_size must be at least 1")
++    if use_dynamic_batching or use_sequence_packing:
++        return dp_size
++    return max(dp_size * train_micro_batch_size, dp_size)
++
++
++def _build_exact_topk_token_gate(
++    priority: torch.Tensor,
++    screen_mask: torch.Tensor,
++    target_fraction: float,
++) -> tuple[torch.Tensor, int]:
++    gate = torch.zeros_like(priority, dtype=torch.float32)
++    flat_mask = screen_mask.reshape(-1)
++    candidate_indices = flat_mask.nonzero(as_tuple=False).squeeze(-1)
++    if candidate_indices.numel() == 0:
++        return gate, 0
++
++    candidate_scores = priority.reshape(-1)[candidate_indices]
++    k_target = max(1, math.ceil(target_fraction * candidate_indices.numel()))
++    _, topk_positions = torch.topk(
++        candidate_scores,
++        k=k_target,
++        largest=True,
++        sorted=False,
++    )
++    selected_indices = candidate_indices[topk_positions]
++    gate.reshape(-1)[selected_indices] = 1.0
++    return gate, int(k_target)
++
++
++def _cover_reference_tokens_with_blocks(
++    reference_token_gate: torch.Tensor,
++    cover_token_mask: torch.Tensor,
++    block_size: int,
++) -> torch.Tensor:
++    covered = torch.zeros_like(reference_token_gate, dtype=torch.float32)
++    if block_size < 1:
++        raise ValueError("block_size must be at least 1")
++
++    for row_idx in range(reference_token_gate.shape[0]):
++        cover_positions = cover_token_mask[row_idx].nonzero(as_tuple=False).squeeze(-1)
++        if cover_positions.numel() == 0:
++            continue
++
++        selected_ordinals = (
++            reference_token_gate[row_idx, cover_positions] > 0
++        ).nonzero(as_tuple=False).squeeze(-1)
++        if selected_ordinals.numel() == 0:
++            continue
++
++        block_ids = torch.unique(selected_ordinals // block_size)
++        for block_id in block_ids.tolist():
++            start = block_id * block_size
++            end = min(start + block_size, cover_positions.numel())
++            covered[row_idx, cover_positions[start:end]] = 1.0
++
++    return covered
++
++
++def screen_kondo_tokens(
++    train_data: BatchedDataDict[Any],
++    cfg: KondoConfig,
++) -> KondoScreeningResult | None:
++    token_mask = train_data["token_mask"][:, 1:]
++    sample_mask = train_data["sample_mask"].unsqueeze(-1)
++    advantages = train_data["advantages"][:, 1:]
++    prev_logprobs = train_data["prev_logprobs"][:, 1:]
++
++    valid_token_mask = (token_mask * sample_mask).bool()
++    total_valid_tokens = int(valid_token_mask.sum().item())
++    row_cost = valid_token_mask.sum(dim=-1).to(torch.int64)
++    rows_total = int((row_cost > 0).sum().item())
++    if total_valid_tokens == 0 or rows_total == 0:
++        return None
++
++    finite_screen_mask = (
++        valid_token_mask
++        & torch.isfinite(prev_logprobs)
++        & torch.isfinite(advantages)
++    )
++    nonfinite_screen_token_count = total_valid_tokens - int(
++        finite_screen_mask.sum().item()
++    )
++    screenable_token_count = int(finite_screen_mask.sum().item())
++    surprisal = torch.zeros_like(prev_logprobs)
++    priority = torch.zeros_like(prev_logprobs)
++    reference_token_gate = torch.zeros_like(prev_logprobs, dtype=torch.float32)
++    if screenable_token_count > 0:
++        surprisal[finite_screen_mask] = (-prev_logprobs.detach())[finite_screen_mask]
++        priority = compute_token_priority(
++            advantages=advantages.detach(),
++            surprisal=surprisal,
++            priority_mode=cfg["priority_mode"],
++        )
++        reference_token_gate, _ = _build_exact_topk_token_gate(
++            priority=priority,
++            screen_mask=finite_screen_mask,
++            target_fraction=cfg["target_backward_token_fraction"],
++        )
++    row_utility = (reference_token_gate * priority).sum(dim=-1)
++    row_response_utility = (priority * finite_screen_mask).sum(dim=-1)
++
++    loss_token_mask = torch.zeros_like(
++        train_data["token_mask"], dtype=train_data["token_mask"].dtype
++    )
++    loss_token_mask[:, 1:] = reference_token_gate.to(dtype=loss_token_mask.dtype)
++    batch_size = train_data["sample_mask"].shape[0]
++    loss_normalizer = torch.full(
++        (batch_size,),
++        float(total_valid_tokens),
++        dtype=torch.float32,
++    )
++    kl_normalizer = loss_normalizer.clone()
++    row_reference_tokens = reference_token_gate.sum(dim=-1).to(torch.int64)
++    row_abs_priority = (reference_token_gate * priority.abs()).sum(dim=-1)
++    row_response_density = row_response_utility / row_cost.clamp(min=1).to(
++        row_response_utility.dtype
++    )
++    total_reference_tokens = int(row_reference_tokens.sum().item())
++
++    return KondoScreeningResult(
++        loss_token_mask=loss_token_mask,
++        loss_normalizer=loss_normalizer,
++        kl_normalizer=kl_normalizer,
++        valid_token_mask=valid_token_mask,
++        screen_mask=finite_screen_mask,
++        reference_token_gate=reference_token_gate,
++        priority=priority,
++        row_cost=row_cost,
++        row_utility=row_utility,
++        row_response_utility=row_response_utility,
++        row_response_density=row_response_density,
++        row_reference_tokens=row_reference_tokens,
++        row_abs_priority=row_abs_priority,
++        total_valid_tokens=total_valid_tokens,
++        total_reference_tokens=total_reference_tokens,
++        screenable_token_count=screenable_token_count,
++        nonfinite_screen_token_count=nonfinite_screen_token_count,
++        rows_total=rows_total,
++        should_bypass=(
++            screenable_token_count == 0
++            or (cfg["bypass_on_nonfinite"] and nonfinite_screen_token_count > 0)
++        ),
++    )
++
++
++def _select_routed_rows(
++    screening: KondoScreeningResult,
++    cfg: KondoConfig,
++    row_multiple: int,
++    row_utility_override: torch.Tensor | None = None,
++    row_token_override: torch.Tensor | None = None,
++) -> torch.Tensor:
++    if row_token_override is None:
++        row_token_override = screening.row_cost
++    positive_cost_rows = (
++        (screening.row_cost > 0) & (row_token_override > 0)
++    ).nonzero(as_tuple=False).squeeze(-1).tolist()
++    filler_rows = (screening.row_cost == 0).nonzero(as_tuple=False).squeeze(-1).tolist()
++    if not positive_cost_rows and not filler_rows:
++        return torch.empty(0, dtype=torch.long)
++
++    def sort_key(idx: int) -> tuple[float, float, int]:
++        if row_utility_override is not None:
++            row_utility = float(row_utility_override[idx].item())
++            row_density = row_utility / max(float(screening.row_cost[idx].item()), 1.0)
++        elif cfg["mode"] in {
++            "response_routed",
++            "response_dense_rows",
++            "response_block_rows",
++        }:
++            row_density = float(screening.row_response_density[idx].item())
++            row_utility = float(screening.row_response_utility[idx].item())
++        else:
++            row_cost = screening.row_cost[idx].item()
++            row_utility = screening.row_utility[idx].item()
++            row_density = row_utility / max(float(row_cost), 1.0)
++        return (-row_density, -row_utility, idx)
++
++    ranked_rows = sorted(positive_cost_rows, key=sort_key)
++    target_budget = max(
++        1,
++        math.ceil(
++            cfg["target_backward_token_fraction"] * screening.total_valid_tokens
++        ),
++    )
++    selected_rows: list[int] = []
++    cumulative_cost = 0
++    min_rows = min(cfg["min_selected_rows"], len(ranked_rows))
++    for idx in ranked_rows:
++        selected_rows.append(idx)
++        cumulative_cost += int(screening.row_cost[idx].item())
++        enough_rows = len(selected_rows) >= min_rows
++        enough_tokens = cumulative_cost >= target_budget
++        aligned = len(selected_rows) % row_multiple == 0
++        if enough_rows and enough_tokens and aligned:
++            break
++
++    if len(selected_rows) % row_multiple != 0:
++        for idx in filler_rows:
++            if idx in selected_rows:
++                continue
++            selected_rows.append(idx)
++            if len(selected_rows) % row_multiple == 0:
++                break
++
++    if len(selected_rows) % row_multiple != 0:
++        for idx in ranked_rows:
++            if idx in selected_rows:
++                continue
++            selected_rows.append(idx)
++            if len(selected_rows) % row_multiple == 0:
++                break
++
++    if len(selected_rows) % row_multiple != 0:
++        raise ValueError(
++            "Kondo routed row selection could not satisfy the required row multiple. "
++            "Increase the batch size or reduce the routing aggressiveness."
++        )
++
++    return torch.tensor(selected_rows, dtype=torch.long)
++
++
++def _select_response_dense_rows_v2(
++    screening: KondoScreeningResult,
++    cfg: KondoConfig,
++    row_multiple: int,
++) -> torch.Tensor:
++    teacher_rows = (
++        (screening.row_reference_tokens > 0) & (screening.row_cost > 0)
++    ).nonzero(as_tuple=False).squeeze(-1)
++    if teacher_rows.numel() == 0:
++        return torch.empty(0, dtype=torch.long)
++
++    def teacher_sort_key(idx: int) -> tuple[float, float, float, int]:
++        row_cost = max(float(screening.row_cost[idx].item()), 1.0)
++        teacher_tokens = float(screening.row_reference_tokens[idx].item())
++        return (
++            -(teacher_tokens / row_cost),
++            -teacher_tokens,
++            -float(screening.row_abs_priority[idx].item()),
++            idx,
++        )
++
++    ranked_teacher_rows = sorted(teacher_rows.tolist(), key=teacher_sort_key)
++    target_teacher_tokens = max(
++        1,
++        math.ceil(cfg["recall_floor"] * screening.total_reference_tokens),
++    )
++    selected_rows: list[int] = []
++    covered_teacher_tokens = 0
++    min_rows = min(cfg["min_selected_rows"], len(ranked_teacher_rows))
++    for idx in ranked_teacher_rows:
++        selected_rows.append(idx)
++        covered_teacher_tokens += int(screening.row_reference_tokens[idx].item())
++        enough_rows = len(selected_rows) >= min_rows
++        enough_recall = covered_teacher_tokens >= target_teacher_tokens
++        if enough_rows and enough_recall:
++            break
++
++    if len(selected_rows) % row_multiple != 0:
++        selected_set = set(selected_rows)
++        filler_rows = [
++            idx
++            for idx in range(screening.row_cost.shape[0])
++            if idx not in selected_set and int(screening.row_reference_tokens[idx].item()) == 0
++        ]
++        filler_rows.sort(key=lambda idx: (int(screening.row_cost[idx].item()), idx))
++        for idx in filler_rows:
++            selected_rows.append(idx)
++            if len(selected_rows) % row_multiple == 0:
++                break
++
++    if len(selected_rows) % row_multiple != 0:
++        selected_set = set(selected_rows)
++        filler_teacher_rows = [
++            idx for idx in ranked_teacher_rows if idx not in selected_set
++        ]
++        filler_teacher_rows.sort(
++            key=lambda idx: (int(screening.row_cost[idx].item()), idx)
++        )
++        for idx in filler_teacher_rows:
++            selected_rows.append(idx)
++            if len(selected_rows) % row_multiple == 0:
++                break
++
++    if len(selected_rows) % row_multiple != 0:
++        raise ValueError(
++            "response_dense_rows_v2 could not satisfy the required row multiple. "
++            "Increase the batch size or reduce the alignment constraint."
++        )
++
++    return torch.tensor(selected_rows, dtype=torch.long)
++
++
++def _select_oracle_dense_rows(
++    screening: KondoScreeningResult,
++    row_multiple: int,
++) -> torch.Tensor:
++    return _select_oracle_mask_rows(
++        mask_rows=screening.row_reference_tokens,
++        row_cost=screening.row_cost,
++        row_multiple=row_multiple,
++    )
++
++
++def _select_oracle_mask_rows(
++    mask_rows: torch.Tensor,
++    row_cost: torch.Tensor,
++    row_multiple: int,
++) -> torch.Tensor:
++    selected_rows = (mask_rows > 0).nonzero(as_tuple=False).squeeze(-1)
++    if selected_rows.numel() == 0:
++        return selected_rows.to(dtype=torch.long)
++
++    if selected_rows.numel() % row_multiple == 0:
++        return selected_rows.to(dtype=torch.long)
++
++    filler_rows = (
++        (row_cost == 0) & (mask_rows == 0)
++    ).nonzero(as_tuple=False).squeeze(-1)
++    if filler_rows.numel() > 0:
++        needed = row_multiple - (selected_rows.numel() % row_multiple)
++        filler_rows = filler_rows[:needed]
++        if filler_rows.numel() == needed:
++            return torch.cat(
++                [selected_rows.to(dtype=torch.long), filler_rows.to(dtype=torch.long)]
++            )
++
++    raise ValueError(
++        "oracle_dense_rows could not satisfy the required row multiple without "
++        "adding non-reference rows. Reduce DP alignment constraints or use "
++        "dense_reference for this configuration."
++    )
++
++
++def apply_kondo_mode(
++    train_data: BatchedDataDict[Any],
++    screening: KondoScreeningResult | None,
++    cfg: KondoConfig,
++    row_multiple: int,
++) -> tuple[BatchedDataDict[Any], dict[str, float]]:
++    metrics = {
++        "kondo_enabled": 1.0,
++        "kondo_mode": kondo_mode_metric(cfg["mode"]),
++        "kondo_target_backward_token_fraction": cfg[
++            "target_backward_token_fraction"
++        ],
++        "kondo_recall_floor": cfg["recall_floor"],
++        "kondo_recall_floor_satisfied": 0.0,
++        "kondo_rows_kept": 0.0,
++        "kondo_rows_total": 0.0,
++        "kondo_selected_token_recall": 0.0,
++        "kondo_selected_token_fraction": 0.0,
++        "kondo_actual_backward_token_fraction": 0.0,
++        "kondo_kept_row_token_fraction": 0.0,
++        "kondo_nonfinite_screen_token_count": 0.0,
++        "kondo_block_size": 0.0,
++        "kondo_bypass_step": 0.0,
++    }
++    if screening is None:
++        metrics["kondo_bypass_step"] = 1.0
++        return train_data, metrics
++
++    metrics["kondo_rows_total"] = float(screening.rows_total)
++    metrics["kondo_nonfinite_screen_token_count"] = float(
++        screening.nonfinite_screen_token_count
++    )
++    if screening.should_bypass:
++        metrics["kondo_bypass_step"] = 1.0
++        return train_data, metrics
++
++    reference_selected_tokens = float(screening.total_reference_tokens)
++    block_reference_token_gate = None
++    block_loss_token_mask = None
++    block_row_tokens = None
++    if cfg["mode"] in {
++        "block_dense_cover",
++        "response_block_rows",
++        "oracle_block_rows",
++    }:
++        block_reference_token_gate = _cover_reference_tokens_with_blocks(
++            reference_token_gate=screening.reference_token_gate,
++            cover_token_mask=screening.screen_mask,
++            block_size=cfg["block_size"],
++        )
++        block_loss_token_mask = torch.zeros_like(
++            train_data["token_mask"], dtype=train_data["token_mask"].dtype
++        )
++        block_loss_token_mask[:, 1:] = block_reference_token_gate.to(
++            dtype=block_loss_token_mask.dtype
++        )
++        block_row_tokens = block_reference_token_gate.sum(dim=-1).to(torch.int64)
++        block_row_utility = (block_reference_token_gate * screening.priority).sum(dim=-1)
++        metrics["kondo_block_size"] = float(cfg["block_size"])
++    if cfg["mode"] == "dense_reference":
++        train_data["loss_token_mask"] = screening.loss_token_mask
++        train_data["loss_normalizer"] = screening.loss_normalizer
++        train_data["kl_normalizer"] = screening.kl_normalizer
++        row_selected = (screening.row_cost > 0).to(dtype=torch.float32)
++        train_data["kondo_row_selected"] = row_selected
++        metrics["kondo_rows_kept"] = float(screening.rows_total)
++        metrics["kondo_selected_token_recall"] = (
++            1.0 if reference_selected_tokens > 0 else 0.0
++        )
++        metrics["kondo_selected_token_fraction"] = float(
++            reference_selected_tokens / max(screening.total_valid_tokens, 1)
++        )
++        metrics["kondo_actual_backward_token_fraction"] = 1.0
++        metrics["kondo_kept_row_token_fraction"] = 1.0
++        return train_data, metrics
++
++    if cfg["mode"] == "block_dense_cover":
++        assert block_loss_token_mask is not None
++        assert block_reference_token_gate is not None
++        block_selected_tokens = float(block_reference_token_gate.sum().item())
++        train_data["loss_token_mask"] = block_loss_token_mask
++        train_data["loss_normalizer"] = screening.loss_normalizer
++        train_data["kl_normalizer"] = screening.kl_normalizer
++        row_selected = (screening.row_cost > 0).to(dtype=torch.float32)
++        train_data["kondo_row_selected"] = row_selected
++        metrics["kondo_rows_kept"] = float(screening.rows_total)
++        metrics["kondo_selected_token_recall"] = (
++            1.0 if reference_selected_tokens > 0 else 0.0
++        )
++        metrics["kondo_selected_token_fraction"] = float(
++            block_selected_tokens / max(screening.total_valid_tokens, 1)
++        )
++        metrics["kondo_actual_backward_token_fraction"] = 1.0
++        metrics["kondo_kept_row_token_fraction"] = 1.0
++        return train_data, metrics
++
++    if cfg["mode"] in {
++        "oracle_dense_rows",
++        "oracle_block_rows",
++        "oracle_full_rows",
++    }:
++        if cfg["mode"] == "oracle_dense_rows":
++            selected_rows = _select_oracle_dense_rows(
++                screening=screening,
++                row_multiple=row_multiple,
++            )
++        elif cfg["mode"] == "oracle_block_rows":
++            assert block_row_tokens is not None
++            selected_rows = _select_oracle_mask_rows(
++                mask_rows=block_row_tokens,
++                row_cost=screening.row_cost,
++                row_multiple=row_multiple,
++            )
++        else:
++            selected_rows = _select_oracle_dense_rows(
++                screening=screening,
++                row_multiple=row_multiple,
++            )
++        if selected_rows.numel() == 0:
++            metrics["kondo_bypass_step"] = 1.0
++            return train_data, metrics
++
++        policy_train_data = train_data.select_indices(selected_rows)
++        if cfg["mode"] == "oracle_dense_rows":
++            policy_train_data["loss_token_mask"] = screening.loss_token_mask[
++                selected_rows
++            ]
++            policy_train_data["loss_normalizer"] = screening.loss_normalizer[
++                selected_rows
++            ]
++            policy_train_data["kl_normalizer"] = screening.kl_normalizer[
++                selected_rows
++            ]
++        elif cfg["mode"] == "oracle_block_rows":
++            assert block_loss_token_mask is not None
++            assert block_reference_token_gate is not None
++            assert block_row_tokens is not None
++            policy_train_data["loss_token_mask"] = block_loss_token_mask[selected_rows]
++            policy_train_data["loss_normalizer"] = screening.loss_normalizer[
++                selected_rows
++            ]
++            policy_train_data["kl_normalizer"] = screening.kl_normalizer[
++                selected_rows
++            ]
++        else:
++            policy_train_data["loss_normalizer"] = screening.loss_normalizer[
++                selected_rows
++            ]
++            policy_train_data["kl_normalizer"] = screening.kl_normalizer[
++                selected_rows
++            ]
++
++        row_selected = torch.zeros_like(train_data["sample_mask"], dtype=torch.float32)
++        row_selected[selected_rows] = 1.0
++        train_data["kondo_row_selected"] = row_selected
++
++        kept_valid_tokens = screening.row_cost[selected_rows].sum().item()
++        kept_reference_tokens = screening.row_reference_tokens[selected_rows].sum().item()
++        metrics["kondo_rows_kept"] = float(selected_rows.numel())
++        if cfg["mode"] == "oracle_block_rows":
++            kept_block_tokens = block_row_tokens[selected_rows].sum().item()
++            metrics["kondo_selected_token_recall"] = (
++                1.0 if reference_selected_tokens > 0 else 0.0
++            )
++            metrics["kondo_selected_token_fraction"] = float(
++                kept_block_tokens / max(screening.total_valid_tokens, 1)
++            )
++            metrics["kondo_actual_backward_token_fraction"] = float(
++                kept_valid_tokens / max(screening.total_valid_tokens, 1)
++            )
++        else:
++            metrics["kondo_selected_token_recall"] = (
++                float(kept_reference_tokens / reference_selected_tokens)
++                if reference_selected_tokens > 0
++                else 0.0
++            )
++            metrics["kondo_selected_token_fraction"] = float(
++                kept_reference_tokens / max(screening.total_valid_tokens, 1)
++            )
++            if cfg["mode"] == "oracle_dense_rows":
++                metrics["kondo_actual_backward_token_fraction"] = float(
++                    kept_valid_tokens / max(screening.total_valid_tokens, 1)
++                )
++            else:
++                metrics["kondo_actual_backward_token_fraction"] = float(
++                    kept_valid_tokens / max(screening.total_valid_tokens, 1)
++                )
++        metrics["kondo_kept_row_token_fraction"] = float(
++            kept_valid_tokens / max(screening.total_valid_tokens, 1)
++        )
++        metrics["kondo_recall_floor_satisfied"] = float(
++            metrics["kondo_selected_token_recall"] + 1e-9 >= cfg["recall_floor"]
++        )
++        return policy_train_data, metrics
++
++    if cfg["mode"] == "response_dense_rows_v2":
++        selected_rows = _select_response_dense_rows_v2(
++            screening=screening,
++            cfg=cfg,
++            row_multiple=row_multiple,
++        )
++    else:
++        selected_rows = _select_routed_rows(
++            screening=screening,
++            cfg=cfg,
++            row_multiple=row_multiple,
++            row_utility_override=(
++                block_row_utility if cfg["mode"] == "response_block_rows" else None
++            ),
++            row_token_override=(
++                block_row_tokens if cfg["mode"] == "response_block_rows" else None
++            ),
++        )
++    if selected_rows.numel() == 0:
++        metrics["kondo_bypass_step"] = 1.0
++        return train_data, metrics
++    if cfg["mode"] in {"routed", "response_dense_rows", "response_dense_rows_v2"}:
++        train_data["loss_token_mask"] = screening.loss_token_mask
++        train_data["loss_normalizer"] = screening.loss_normalizer
++        train_data["kl_normalizer"] = screening.kl_normalizer
++    elif cfg["mode"] == "response_block_rows":
++        assert block_loss_token_mask is not None
++        train_data["loss_token_mask"] = block_loss_token_mask
++        train_data["loss_normalizer"] = screening.loss_normalizer
++        train_data["kl_normalizer"] = screening.kl_normalizer
++    policy_train_data = train_data.select_indices(selected_rows)
++    if cfg["mode"] == "response_routed":
++        # Keep the objective scale matched to the original full batch even
++        # though we only backprop through the compacted kept rows.
++        policy_train_data["loss_normalizer"] = screening.loss_normalizer[
++            selected_rows
++        ]
++        policy_train_data["kl_normalizer"] = screening.kl_normalizer[selected_rows]
++    row_selected = torch.zeros_like(train_data["sample_mask"], dtype=torch.float32)
++    row_selected[selected_rows] = 1.0
++    train_data["kondo_row_selected"] = row_selected
++
++    kept_valid_tokens = screening.row_cost[selected_rows].sum().item()
++    kept_reference_tokens = screening.row_reference_tokens[selected_rows].sum().item()
++    metrics["kondo_rows_kept"] = float(selected_rows.numel())
++    if cfg["mode"] == "response_routed":
++        metrics["kondo_selected_token_recall"] = (
++            float(kept_reference_tokens / reference_selected_tokens)
++            if reference_selected_tokens > 0
++            else 0.0
++        )
++        metrics["kondo_selected_token_fraction"] = float(
++            kept_reference_tokens / max(screening.total_valid_tokens, 1)
++        )
++        metrics["kondo_actual_backward_token_fraction"] = float(
++            kept_valid_tokens / max(screening.total_valid_tokens, 1)
++        )
++    elif cfg["mode"] == "response_block_rows":
++        assert block_row_tokens is not None
++        kept_block_tokens = block_row_tokens[selected_rows].sum().item()
++        metrics["kondo_selected_token_recall"] = (
++            float(kept_reference_tokens / reference_selected_tokens)
++            if reference_selected_tokens > 0
++            else 0.0
++        )
++        metrics["kondo_selected_token_fraction"] = float(
++            kept_block_tokens / max(screening.total_valid_tokens, 1)
++        )
++        metrics["kondo_actual_backward_token_fraction"] = float(
++            kept_valid_tokens / max(screening.total_valid_tokens, 1)
++        )
++    else:
++        metrics["kondo_selected_token_recall"] = (
++            float(kept_reference_tokens / reference_selected_tokens)
++            if reference_selected_tokens > 0
++            else 0.0
++        )
++        metrics["kondo_selected_token_fraction"] = float(
++            kept_reference_tokens / max(screening.total_valid_tokens, 1)
++        )
++        metrics["kondo_actual_backward_token_fraction"] = float(
++            kept_valid_tokens / max(screening.total_valid_tokens, 1)
++        )
++    metrics["kondo_kept_row_token_fraction"] = float(
++        kept_valid_tokens / max(screening.total_valid_tokens, 1)
++    )
++    metrics["kondo_recall_floor_satisfied"] = float(
++        metrics["kondo_selected_token_recall"] + 1e-9 >= cfg["recall_floor"]
++    )
++    return policy_train_data, metrics
+diff --git a/tests/unit/algorithms/test_kondo.py b/tests/unit/algorithms/test_kondo.py
+new file mode 100644
+index 0000000..c2bf2c9
+--- /dev/null
++++ b/tests/unit/algorithms/test_kondo.py
+@@ -0,0 +1,312 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import torch
++
++from nemo_rl.algorithms.kondo import (
++    apply_kondo_mode,
++    compute_required_row_multiple,
++    resolve_kondo_config,
++    screen_kondo_tokens,
++)
++from nemo_rl.algorithms.loss import ClippedPGLossFn
++from nemo_rl.distributed.batched_data_dict import BatchedDataDict
++
++
++def _make_train_data() -> BatchedDataDict:
++    return BatchedDataDict(
++        {
++            "input_ids": torch.tensor(
++                [
++                    [1, 11, 12, 13],
++                    [1, 21, 22, 23],
++                    [1, 31, 32,  0],
++                ],
++                dtype=torch.long,
++            ),
++            "token_mask": torch.tensor(
++                [
++                    [0.0, 1.0, 1.0, 1.0],
++                    [0.0, 1.0, 1.0, 1.0],
++                    [0.0, 1.0, 1.0, 0.0],
++                ]
++            ),
++            "sample_mask": torch.tensor([1.0, 1.0, 1.0]),
++            "advantages": torch.tensor(
++                [
++                    [0.0, 3.0, 3.0, 3.0],
++                    [0.0, 1.0, 1.0, 1.0],
++                    [0.0, 2.0, 2.0, 0.0],
++                ]
++            ),
++            "prev_logprobs": torch.tensor(
++                [
++                    [0.0, -4.0, -3.0, -2.0],
++                    [0.0, -1.0, -1.0, -1.0],
++                    [0.0, -2.0, -2.0,  0.0],
++                ]
++            ),
++            "generation_logprobs": torch.tensor(
++                [
++                    [0.0, -4.0, -3.0, -2.0],
++                    [0.0, -1.0, -1.0, -1.0],
++                    [0.0, -2.0, -2.0,  0.0],
++                ]
++            ),
++        }
++    )
++
++
++def test_compute_required_row_multiple_respects_batching_mode():
++    assert compute_required_row_multiple(2, 4, False, False) == 8
++    assert compute_required_row_multiple(2, 4, True, False) == 2
++    assert compute_required_row_multiple(2, 4, False, True) == 2
++
++
++def test_screen_kondo_tokens_builds_exact_dense_reference_gate():
++    cfg = resolve_kondo_config(
++        {
++            "enabled": True,
++            "mode": "dense_reference",
++            "target_backward_token_fraction": 0.5,
++            "priority_mode": "delight",
++        }
++    )
++    screening = screen_kondo_tokens(_make_train_data(), cfg)
++
++    assert screening is not None
++    assert screening.total_valid_tokens == 8
++    assert screening.screenable_token_count == 8
++    assert screening.reference_token_gate.sum().item() == 4.0
++    assert screening.loss_token_mask.shape == torch.Size([3, 4])
++    assert screening.loss_token_mask[:, 0].sum().item() == 0.0
++
++
++def test_apply_kondo_mode_dense_reference_preserves_full_batch():
++    cfg = resolve_kondo_config(
++        {
++            "enabled": True,
++            "mode": "dense_reference",
++            "target_backward_token_fraction": 0.5,
++        }
++    )
++    train_data = _make_train_data()
++    screening = screen_kondo_tokens(train_data, cfg)
++    policy_train_data, metrics = apply_kondo_mode(
++        train_data=train_data,
++        screening=screening,
++        cfg=cfg,
++        row_multiple=1,
++    )
++
++    assert policy_train_data["input_ids"].shape[0] == 3
++    assert metrics["kondo_rows_total"] == 3.0
++    assert metrics["kondo_rows_kept"] == 3.0
++    assert metrics["kondo_selected_token_recall"] == 1.0
++    assert metrics["kondo_actual_backward_token_fraction"] == 1.0
++    assert metrics["kondo_kept_row_token_fraction"] == 1.0
++    assert "loss_token_mask" in train_data
++
++
++def test_apply_kondo_mode_routed_compacts_rows_under_alignment_constraints():
++    cfg = resolve_kondo_config(
++        {
++            "enabled": True,
++            "mode": "routed",
++            "target_backward_token_fraction": 0.25,
++            "priority_mode": "delight",
++            "min_selected_rows": 1,
++        }
++    )
++    train_data = _make_train_data()
++    screening = screen_kondo_tokens(train_data, cfg)
++    policy_train_data, metrics = apply_kondo_mode(
++        train_data=train_data,
++        screening=screening,
++        cfg=cfg,
++        row_multiple=2,
++    )
++
++    assert policy_train_data["input_ids"].shape[0] == 2
++    assert metrics["kondo_rows_kept"] == 2.0
++    assert metrics["kondo_rows_total"] == 3.0
++    assert metrics["kondo_selected_token_recall"] == 1.0
++    assert metrics["kondo_actual_backward_token_fraction"] == 0.25
++    assert metrics["kondo_kept_row_token_fraction"] == 0.75
++    assert train_data["kondo_row_selected"].sum().item() == 2.0
++
++
++def test_apply_kondo_mode_response_dense_rows_v2_preserves_teacher_recall():
++    cfg = resolve_kondo_config(
++        {
++            "enabled": True,
++            "mode": "response_dense_rows_v2",
++            "target_backward_token_fraction": 0.25,
++            "recall_floor": 1.0,
++            "priority_mode": "delight",
++            "min_selected_rows": 1,
++        }
++    )
++    train_data = _make_train_data()
++    screening = screen_kondo_tokens(train_data, cfg)
++    policy_train_data, metrics = apply_kondo_mode(
++        train_data=train_data,
++        screening=screening,
++        cfg=cfg,
++        row_multiple=2,
++    )
++
++    assert screening is not None
++    assert policy_train_data["input_ids"].shape[0] == 2
++    assert metrics["kondo_rows_kept"] == 2.0
++    assert metrics["kondo_selected_token_recall"] == 1.0
++    assert metrics["kondo_selected_token_fraction"] == 0.25
++    assert metrics["kondo_actual_backward_token_fraction"] == 0.625
++    assert metrics["kondo_kept_row_token_fraction"] == 0.625
++    assert metrics["kondo_recall_floor"] == 1.0
++    assert metrics["kondo_recall_floor_satisfied"] == 1.0
++    torch.testing.assert_close(
++        policy_train_data["loss_token_mask"][:, 1:].sum(dim=-1),
++        torch.tensor([2.0, 0.0]),
++    )
++
++
++def test_response_dense_rows_v2_zero_cost_alignment_filler_does_not_force_dense():
++    train_data = BatchedDataDict(
++        {
++            "input_ids": torch.tensor(
++                [
++                    [1, 11, 12],
++                    [1,  0,  0],
++                ],
++                dtype=torch.long,
++            ),
++            "token_mask": torch.tensor(
++                [
++                    [0.0, 1.0, 1.0],
++                    [0.0, 0.0, 0.0],
++                ]
++            ),
++            "sample_mask": torch.tensor([1.0, 1.0]),
++            "advantages": torch.tensor(
++                [
++                    [0.0, 3.0, 3.0],
++                    [0.0, 0.0, 0.0],
++                ]
++            ),
++            "prev_logprobs": torch.tensor(
++                [
++                    [0.0, -4.0, -3.0],
++                    [0.0, 0.0, 0.0],
++                ]
++            ),
++            "generation_logprobs": torch.tensor(
++                [
++                    [0.0, -4.0, -3.0],
++                    [0.0, 0.0, 0.0],
++                ]
++            ),
++        }
++    )
++    cfg = resolve_kondo_config(
++        {
++            "enabled": True,
++            "mode": "response_dense_rows_v2",
++            "target_backward_token_fraction": 0.5,
++            "recall_floor": 1.0,
++            "priority_mode": "delight",
++            "min_selected_rows": 1,
++        }
++    )
++    screening = screen_kondo_tokens(train_data, cfg)
++    policy_train_data, metrics = apply_kondo_mode(
++        train_data=train_data,
++        screening=screening,
++        cfg=cfg,
++        row_multiple=2,
++    )
++
++    assert policy_train_data["input_ids"].shape[0] == 2
++    assert metrics["kondo_bypass_step"] == 0.0
++    assert metrics["kondo_selected_token_recall"] == 1.0
++    assert metrics["kondo_actual_backward_token_fraction"] == 1.0
++    assert train_data["kondo_row_selected"].tolist() == [1.0, 1.0]
++
++
++def test_kondo_bypasses_when_nonfinite_screen_tokens_are_present():
++    cfg = resolve_kondo_config(
++        {
++            "enabled": True,
++            "mode": "routed",
++            "target_backward_token_fraction": 0.5,
++            "bypass_on_nonfinite": True,
++        }
++    )
++    train_data = _make_train_data()
++    train_data["prev_logprobs"][0, 1] = float("-inf")
++    screening = screen_kondo_tokens(train_data, cfg)
++    policy_train_data, metrics = apply_kondo_mode(
++        train_data=train_data,
++        screening=screening,
++        cfg=cfg,
++        row_multiple=1,
++    )
++
++    assert screening is not None
++    assert screening.should_bypass is True
++    assert policy_train_data["input_ids"].shape[0] == 3
++    assert metrics["kondo_bypass_step"] == 1.0
++    assert metrics["kondo_nonfinite_screen_token_count"] == 1.0
++
++
++def test_clipped_pg_loss_respects_loss_token_mask_and_normalizer():
++    cfg = {
++        "ratio_clip_min": 0.2,
++        "ratio_clip_max": 0.2,
++        "ratio_clip_c": None,
++        "disable_ppo_ratio": True,
++        "reference_policy_kl_penalty": 0.0,
++        "reference_policy_kl_type": "k3",
++        "kl_input_clamp_value": 20.0,
++        "kl_output_clamp_value": 10.0,
++        "use_on_policy_kl_approximation": False,
++        "use_importance_sampling_correction": False,
++        "truncated_importance_sampling_ratio": None,
++        "sequence_level_importance_ratios": False,
++        "token_level_loss": True,
++        "force_on_policy_ratio": False,
++    }
++    loss_fn = ClippedPGLossFn(cfg)
++    data = BatchedDataDict(
++        {
++            "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
++            "advantages": torch.tensor([[0.0, 2.0, 2.0, 2.0]]),
++            "prev_logprobs": torch.tensor([[0.0, -1.0, -2.0, -3.0]]),
++            "generation_logprobs": torch.tensor([[0.0, -1.0, -2.0, -3.0]]),
++            "token_mask": torch.tensor([[0.0, 1.0, 1.0, 1.0]]),
++            "loss_token_mask": torch.tensor([[0.0, 1.0, 0.0, 1.0]]),
++            "loss_normalizer": torch.tensor([4.0]),
++            "sample_mask": torch.tensor([1.0]),
++        }
++    )
++    next_token_logprobs = torch.tensor([[-1.0, -2.0, -3.0]])
++
++    loss, _ = loss_fn(
++        next_token_logprobs=next_token_logprobs,
++        data=data,
++        global_valid_seqs=torch.tensor(1.0),
++        global_valid_toks=torch.tensor(3.0),
++    )
++
++    torch.testing.assert_close(loss, torch.tensor(2.0))
